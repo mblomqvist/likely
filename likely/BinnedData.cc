@@ -13,51 +13,10 @@
 
 namespace local = likely;
 
-local::BinnedData::BinnedData(std::vector<AbsBinningCPtr> axes)
-: _axisBinning(axes)
+local::BinnedData::BinnedData(BinnedGrid const &grid)
+: _grid(grid)
 {
-    if(0 == axes.size()) {
-        throw RuntimeError("BinnedData: no axes provided.");
-    }
-    _initialize();
-}
-
-local::BinnedData::BinnedData(AbsBinningCPtr axis1)
-{
-    if(!axis1) {
-        throw RuntimeError("BinnedData: missing axis1.");
-    }
-    _axisBinning.push_back(axis1);
-    _initialize();
-}
-
-local::BinnedData::BinnedData(AbsBinningCPtr axis1, AbsBinningCPtr axis2)
-{
-    if(!axis1 || !axis2) {
-        throw RuntimeError("BinnedData: missing axis data.");
-    }
-    _axisBinning.push_back(axis1);    
-    _axisBinning.push_back(axis2);
-    _initialize();
-}
-
-local::BinnedData::BinnedData(AbsBinningCPtr axis1, AbsBinningCPtr axis2, AbsBinningCPtr axis3)
-{
-    if(!axis1 || !axis2 || !axis3) {
-        throw RuntimeError("BinnedData: missing axis data.");
-    }
-    _axisBinning.push_back(axis1);
-    _axisBinning.push_back(axis2);
-    _axisBinning.push_back(axis3);
-    _initialize();
-}
-
-void local::BinnedData::_initialize() {
-    _nbins = 1;
-    BOOST_FOREACH(AbsBinningCPtr binning, _axisBinning) {
-        _nbins *= binning->getNBins();
-    }
-    _offset.resize(_nbins,EMPTY_BIN);
+    _offset.resize(_grid.getNBinsTotal(),EMPTY_BIN);
     _weight = 1;
     _weighted = false;
     _finalized = false;
@@ -66,28 +25,7 @@ void local::BinnedData::_initialize() {
 local::BinnedData::~BinnedData() { }
 
 local::BinnedData *local::BinnedData::clone(bool binningOnly) const {
-    return binningOnly ? new BinnedData(getAxisBinning()) : new BinnedData(*this);
-}
-
-// The pass-by-value semantics used here are not a mistake: see
-// http://stackoverflow.com/questions/3279543/what-is-the-copy-and-swap-idiom
-local::BinnedData& local::BinnedData::operator=(BinnedData other) {
-    swap(*this,other);
-    return *this;
-}
-
-void local::swap(BinnedData& a, BinnedData& b) {
-    // Enable argument-dependent lookup (ADL)
-    using std::swap;
-    swap(a._nbins,b._nbins);
-    swap(a._axisBinning,b._axisBinning);
-    swap(a._offset,b._offset);
-    swap(a._index,b._index);
-    swap(a._data,b._data);
-    swap(a._covariance,b._covariance);
-    swap(a._weight,b._weight);
-    swap(a._weighted,b._weighted);
-    swap(a._finalized,b._finalized);
+    return binningOnly ? new BinnedData(_grid) : new BinnedData(*this);
 }
 
 void local::BinnedData::cloneCovariance() {
@@ -98,11 +36,11 @@ void local::BinnedData::cloneCovariance() {
     }
 }
 
-void local::BinnedData::dropCovariance() {
-    if(hasCovariance() && isFinalized()) {
-        throw RuntimeError("BinnedData::dropCovariance: object is finalized.");
-    }
+void local::BinnedData::dropCovariance(double weight) {
+    if(isFinalized()) throw RuntimeError("BinnedData::dropCovariance: object is finalized.");
+    unweightData();
     _covariance.reset();
+    _weight = weight;
 }
 
 local::BinnedData& local::BinnedData::add(BinnedData const& other, double weight) {
@@ -143,7 +81,7 @@ local::BinnedData& local::BinnedData::add(BinnedData const& other, double weight
         }
     }
     // Add the weighted _data vectors, element by element, and save the result in our _data.
-    _setWeighted(true);
+    _setWeighted(true,true); // flushes any cached data
     other._setWeighted(true);
     for(int offset = 0; offset < _data.size(); ++offset) {
         _data[offset] += weight*other._data[offset];
@@ -158,80 +96,92 @@ local::BinnedData& local::BinnedData::add(BinnedData const& other, double weight
     return *this;
 }
 
-void local::BinnedData::_setWeighted(bool weighted) const {
-    // Are we already in the desired state?
-    if(weighted == _weighted) return;
-    if(weighted) {
-        if(hasCovariance() && getNBinsWithData() > 0) {
-            // Change data to Cinv.data
-            _covariance->multiplyByInverseCovariance(_data);
-        }
-        else if(_weight != 1) {
-            // Scale data by _weight, which plays the role of Cinv.
-            for(int offset = 0; offset < _data.size(); ++offset) _data[offset] *= _weight;
-        }
-    }
-    else {
-        if(hasCovariance() && getNBinsWithData() > 0) {
-            // Change Cinv.data to data = C.Cinv.data
-            _covariance->multiplyByCovariance(_data);
-        }
-        else if(_weight != 1) {
-            // Scale data by 1/_weight, which plays the role of C.
-            for(int offset = 0; offset < _data.size(); ++offset) _data[offset] /= _weight;
-        }
-    }
-    // Record our new state.
-    _weighted = weighted;
+void local::BinnedData::unweightData() {
+    // Note that both the methods below are const but we still declare this public method
+    // as non-const since there is never any need to call it unless it will be followed
+    // by a non-const method call that modifies our covariance.
+    _setWeighted(false,true); // flushes any cached data
 }
 
-bool local::BinnedData::isCongruent(BinnedData const& other, bool onlyBinning) const {
-    // Must have same number of axes.
-    int nAxes(getNAxes());
-    if(other.getNAxes() != nAxes) return false;
-    // Binning must be represented by the same (not equivalent) object along each axis.
-    for(int axis = 0; axis < nAxes; ++axis) {
-        if(other._axisBinning[axis] != _axisBinning[axis]) return false;
+void local::BinnedData::_setWeighted(bool weighted, bool flushCache) const {
+    // Are we already in the desired state?
+    if(weighted != _weighted) {
+        // Do we have a cached result we can use?
+        if(_dataCache.size() > 0) {
+            // Enable argument-dependent lookup (ADL)
+            using std::swap;
+            swap(_data,_dataCache);
+        }
+        else {
+#ifdef PARANOID_DATA_CACHE
+            // Save the original state of our cache.
+            std::vector<double> saveCache = _dataCache;
+#endif
+            // Copy the original data to our cache (unless we are going to flush it below)
+            if(!flushCache) _dataCache = _data;
+        
+            // Do the appropriate transformation of our data vector.
+            if(weighted) {
+                if(hasCovariance() && getNBinsWithData() > 0) {
+                    // Change data to Cinv.data
+                    _covariance->multiplyByInverseCovariance(_data);
+                }
+                else if(_weight != 1) {
+                    // Scale data by _weight, which plays the role of Cinv.
+                    for(int offset = 0; offset < _data.size(); ++offset) _data[offset] *= _weight;
+                }
+            }
+            else {
+                if(hasCovariance() && getNBinsWithData() > 0) {
+                    // Change Cinv.data to data = C.Cinv.data
+                    _covariance->multiplyByCovariance(_data);
+                }
+                else if(_weight != 1) {
+                    // Scale data by 1/_weight, which plays the role of C.
+                    for(int offset = 0; offset < _data.size(); ++offset) _data[offset] /= _weight;
+                }
+            }
+#ifdef PARANOID_DATA_CACHE
+            // If we have a saved cache, was it actually valid?
+            if(saveCache.size() > 0) {
+                assert(saveCache.size() == _data.size());
+                for(int offset = 0; offset < _data.size(); ++offset) {
+                    double eps = std::fabs(_data[offset] - saveCache[offset]);
+                    if(eps > 1e-8) {
+                        std::cerr << "Invalid BinnedData cache: " << offset << ' '
+                            << _data[offset] << " != " << saveCache[offset] << " (eps = "
+                            << eps << ")" << std::endl;
+                        assert(false);
+                        break;
+                    }
+                }
+            }
+#endif        
+        }
+        // Record our new state.
+        _weighted = weighted;
     }
+    // Flush the cache now, if requested. We use resize instead of swapping with an empty vector
+    // since we are likely to need at least as much capacity in future, and the overhead of
+    // this cache is small compared with a covariance matrix.
+    if(flushCache) _dataCache.resize(0);
+}
+
+bool local::BinnedData::isCongruent(BinnedData const& other, bool onlyBinning, bool ignoreCovariance) const {
+    if(!_grid.isCongruent(other.getGrid())) return false;
     if(!onlyBinning) {
-        // Both must have or not have an associated covariance matrix.
-        if(other.hasCovariance() && !hasCovariance()) return false;
-        if(!other.hasCovariance() && hasCovariance()) return false;
-        // List (not set) of bins with data must be the same.
+        // [2] List (not set, i.e., order matters) of bins with data must be the same.
         if(other.getNBinsWithData() != getNBinsWithData()) return false;
         for(int offset = 0; offset < _index.size(); ++offset) {
             if(other._index[offset] != _index[offset]) return false;
         }
+        if(!ignoreCovariance) {
+            // [3] Both must have or not have an associated covariance matrix.
+            if(other.hasCovariance() && !hasCovariance()) return false;
+            if(!other.hasCovariance() && hasCovariance()) return false;
+        }
     }
     return true;
-}
-
-int local::BinnedData::getIndex(std::vector<int> const &binIndices) const {
-    int nAxes(getNAxes());
-    if(binIndices.size() != nAxes) {
-        throw RuntimeError("BinnedData::getIndex: invalid input vector size.");
-    }
-    int index(0);
-    for(int axis = 0; axis < nAxes; ++axis) {
-        int binIndex(binIndices[axis]), nBins(_axisBinning[axis]->getNBins());
-        if(binIndex < 0 || binIndex >= nBins) {
-            throw RuntimeError("BinnedData::getIndex: invalid bin index.");
-        }
-        index = binIndex + index*nBins;
-    }
-    return index;
-}
-
-int local::BinnedData::getIndex(std::vector<double> const &values) const {
-    int index(0), nAxes(getNAxes());
-    if(values.size() != nAxes) {
-        throw RuntimeError("BinnedData::getIndex: invalid input vector size.");
-    }
-    std::vector<int> binIndices;
-    for(int axis = 0; axis < nAxes; ++axis) {
-        binIndices.push_back(_axisBinning[axis]->getBinIndex(values[axis]));
-    }
-    return getIndex(binIndices);
 }
 
 int local::BinnedData::getIndexAtOffset(int offset) const {
@@ -248,54 +198,8 @@ int local::BinnedData::getOffsetForIndex(int index) const {
     return _offset[index];
 }
 
-void local::BinnedData::_checkIndex(int index) const {
-    if(index < 0 || index >= _nbins) {
-        throw RuntimeError("BinnedData: invalid index " +
-            boost::lexical_cast<std::string>(index));
-    }
-}
-
-void local::BinnedData::getBinIndices(int index, std::vector<int> &binIndices) const {
-    _checkIndex(index);
-    int nAxes(getNAxes());
-    binIndices.resize(nAxes,0);
-    int partial(index);
-    for(int axis = nAxes-1; axis >= 0; --axis) {
-        AbsBinningCPtr binning = _axisBinning[axis];
-        int nBins(binning->getNBins()), binIndex(partial % nBins);
-        binIndices[axis] = binIndex;
-        partial = (partial - binIndex)/nBins;
-    }
-}
-
-void local::BinnedData::getBinCenters(int index, std::vector<double> &binCenters) const {
-    _checkIndex(index);
-    binCenters.resize(0);
-    binCenters.reserve(getNAxes());
-    std::vector<int> binIndices;
-    getBinIndices(index,binIndices);
-    int nAxes(getNAxes());
-    for(int axis = 0; axis < nAxes; ++axis) {
-        AbsBinningCPtr binning = _axisBinning[axis];
-        binCenters.push_back(binning->getBinCenter(binIndices[axis]));
-    }
-}
-
-void local::BinnedData::getBinWidths(int index, std::vector<double> &binWidths) const {
-    _checkIndex(index);
-    binWidths.resize(0);
-    binWidths.reserve(getNAxes());
-    std::vector<int> binIndices;
-    getBinIndices(index,binIndices);
-    int nAxes(getNAxes());
-    for(int axis = 0; axis < nAxes; ++axis) {
-        AbsBinningCPtr binning = _axisBinning[axis];
-        binWidths.push_back(binning->getBinWidth(binIndices[axis]));
-    }
-}
-
 bool local::BinnedData::hasData(int index) const {
-    _checkIndex(index);
+    _grid.checkIndex(index);
     return !(_offset[index] == EMPTY_BIN);
 }
 
@@ -308,7 +212,7 @@ double local::BinnedData::getData(int index, bool weighted) const {
 }
 
 void local::BinnedData::setData(int index, double value, bool weighted) {
-    _setWeighted(weighted);
+    _setWeighted(weighted,true); // flushes any cached data
     if(hasData(index)) {
         _data[_offset[index]] = value;
     }
@@ -329,7 +233,7 @@ void local::BinnedData::addData(int index, double offset, bool weighted) {
     if(!hasData(index)) {
         throw RuntimeError("BinnedData::addData: bin is empty.");        
     }
-    _setWeighted(weighted);
+    _setWeighted(weighted,true); // flushes any cached data
     _data[_offset[index]] += offset;
 }
 
@@ -396,11 +300,70 @@ void local::BinnedData::transformCovariance(CovarianceMatrixPtr D) {
         throw RuntimeError("BinnedData::transformCovariance: no covariance to transform.");
     }
     // Make sure that our _data vector is independent of our _covariance before it changes.
-    _setWeighted(false);
+    unweightData();
     // Replace D with C.Dinv.C where C is our original covariance matrix.
     D->replaceWithTripleProduct(*_covariance);
     // Swap C with D
     swap(*D,*_covariance);
+}
+
+void local::BinnedData::rescaleEigenvalues(std::vector<double> modeScales) {
+    if(!hasCovariance()) {
+        throw RuntimeError("BinnedData::rescaleEigenvalues: no covariance to transform.");
+    }
+    // Check that the scale vector has the expected size.
+    if(modeScales.size() != getNBinsWithData()) {
+        throw RuntimeError("BinnedData::rescaleEigenvalues: unexpected number of mode scales.");
+    }
+    // Make sure that our _data vector is independent of our _covariance before it changes.
+    unweightData();
+    // Rescale our covariance matrix in place.
+    _covariance->rescaleEigenvalues(modeScales);
+}
+
+int local::BinnedData::projectOntoModes(int nkeep) {
+    if(isFinalized()) {
+        throw RuntimeError("BinnedData::projectOntoModes: object is finalized.");
+    }
+    if(!hasCovariance()) {
+        throw RuntimeError("BinnedData::projectOntoModes: no covariance to define modes.");
+    }
+    int size(getNBinsWithData());
+    if(0 == nkeep || nkeep >= size || nkeep <= -size) {
+        throw RuntimeError("BinnedData::projectOntoModes: invalid value of nkeep.");
+    }
+    // Do the eigenmode analysis.
+    std::vector<double> eigenvalues,eigenvectors;
+    _covariance->getEigenModes(eigenvalues,eigenvectors);
+    // What range of modes are we projecting onto?
+    int index1,index2,ndrop;
+    if(nkeep > 0) {
+        index1 = 0;
+        index2 = nkeep;
+        ndrop = size - nkeep;
+    }
+    else {
+        index1 = size + nkeep;
+        index2 = size;
+        ndrop = size + nkeep;
+    }
+    // Prepare to change our data vector.
+    unweightData();
+    std::vector<double> projected(size,0);
+    // Loop over modes
+    for(int index = index1; index < index2; ++index) {
+        // Calculate the dot product of this mode with our data vector.
+        double dotprod(0);
+        for(int bin = 0; bin < size; ++bin) {
+            dotprod += _data[bin]*eigenvectors[index*size+bin];
+        }
+        // Update our projected vector.
+        for(int bin = 0; bin < size; ++bin) {
+            projected[bin] += dotprod*eigenvectors[index*size+bin];
+        }
+    }
+    _data = projected;
+    return ndrop;
 }
 
 void local::BinnedData::setCovarianceMatrix(CovarianceMatrixPtr covariance) {
@@ -413,8 +376,26 @@ void local::BinnedData::setCovarianceMatrix(CovarianceMatrixPtr covariance) {
     _covariance = covariance;
 }
 
+void local::BinnedData::shareCovarianceMatrix(BinnedData const &other) {
+    if(isFinalized()) {
+        throw RuntimeError("BinnedData::shareCovarianceMatrix: object is finalized.");
+    }
+    if(!other.hasCovariance()) {
+        throw RuntimeError("BinnedData::shareCovarianceMatrix: no other covariance to share.");
+    }
+    // Ignore covariance when we test for congruence.
+    if(!isCongruent(other,false,true)) {
+        throw RuntimeError("BinnedData::shareCovarianceMatrix: datasets are not congruent.");
+    }
+    _covariance = other._covariance;
+}
+
 bool local::BinnedData::compress(bool weighted) const {
+    // Get our data vector into the requested format (weighted/unweighted)
     _setWeighted(weighted);
+    // Drop any storage used by our cache of the alternate format.
+    std::vector<double>().swap(_dataCache);
+    // Compress our covariance matrix, if any.
     return _covariance.get() ? _covariance->compress() : false;
 }
 
@@ -428,7 +409,8 @@ bool local::BinnedData::isCompressed() const {
 
 std::size_t local::BinnedData::getMemoryUsage(bool includeCovariance) const {
     std::size_t size = sizeof(*this) +
-        sizeof(int)*(_offset.capacity() + _index.capacity()) + sizeof(double)*_data.capacity();
+        sizeof(int)*(_offset.capacity() + _index.capacity()) +
+        sizeof(double)*(_data.capacity() + _dataCache.capacity());
     if(hasCovariance() && includeCovariance) size += _covariance->getMemoryUsage();
     return size;
 }
@@ -441,18 +423,18 @@ void local::BinnedData::prune(std::set<int> const &keep) {
     // all indices are valid.
     std::set<int> offsets;
     BOOST_FOREACH(int index, keep) {
-        _checkIndex(index);
+        _grid.checkIndex(index);
         offsets.insert(_offset[index]);
     }
     // Are we actually removing anything?
     int newSize(offsets.size());
     if(newSize == getNBinsWithData()) return;
     // Reset our vector of offset for each index with data.
-    _offset.assign(_nbins,EMPTY_BIN);
+    _offset.assign(_grid.getNBinsTotal(),EMPTY_BIN);
     // Shift our (unweighted) data vector elements down to compress out any elements
     // we are not keeping. We are using the fact that std::set guarantees that iteration
     // follows sort order, from smallest to largest key value.
-    _setWeighted(false);
+    unweightData();
     int newOffset(0);
     BOOST_FOREACH(int oldOffset, offsets) {
         // oldOffset >= newOffset so we will never clobber an element that we still need
@@ -530,4 +512,74 @@ void local::BinnedData::printToStream(std::ostream &out, std::string format) con
         int index(*iter);
         out << (indexFormat % index) << (valueFormat % getData(index)) << std::endl;
     }
+}
+
+void local::BinnedData::saveData(std::ostream &os, bool weighted) const {    
+    for(IndexIterator iter = begin(); iter != end(); ++iter) {
+        double value = getData(*iter,weighted);
+        // Use lexical_cast to ensure that the full double precision is saved.
+        os << *iter << ' ' << boost::lexical_cast<std::string>(value) << std::endl;
+    }
+}
+
+void local::BinnedData::saveInverseCovariance(std::ostream &os, double scale) const {
+    if(!getCovarianceMatrix()->isPositiveDefinite()) {
+        throw RuntimeError("BinnedData::saveInverseCovariance: matrix is not positive definite.");
+    }
+    for(IndexIterator iter1 = begin(); iter1 != end(); ++iter1) {
+        int index1(*iter1);
+        // Save all diagonal elements.
+        double value = scale*getInverseCovariance(index1,index1);
+        os << index1 << ' ' << index1 << ' '
+            << boost::lexical_cast<std::string>(value) << std::endl;
+        // Loop over pairs with index2 > index1
+        for(IndexIterator iter2 = iter1; ++iter2 != end();) {
+            int index2(*iter2);
+            value = scale*getInverseCovariance(index1,index2);
+            // Only save non-zero off-diagonal elements.
+            if(0 == value) continue;
+            // Use lexical_cast to ensure that the full double precision is saved.
+            os << index1 << ' ' << index2 << ' ' << boost::lexical_cast<std::string>(value) << std::endl;
+        }
+    }
+}
+
+local::BinnedDataPtr local::BinnedData::sample(RandomPtr random) const {
+    // Create a new dataset with the same binning.
+    bool binningOnly(true);
+    BinnedDataPtr sampled(this->clone(binningOnly));
+    // Fill the new dataset with noise sampled from our covariance.
+    _covariance->sample(sampled->_data,random);
+    // Copy our data vector book-keeping arrays to the sampled dataset.
+    sampled->_offset = _offset;
+    sampled->_index = _index;
+    // Add our (unweighted) data vector to the sampled noise.
+    _setWeighted(false);
+    // sampled was constructed with _weighted = false and empty _dataCache so
+    // the next line shouldn't actually do anything
+    sampled->unweightData();
+    for(int offset = 0; offset < _data.size(); ++offset) {
+        sampled->_data[offset] += _data[offset];
+    }
+    // Copy our covariance matrix to the sampled data.
+    sampled->setCovarianceMatrix(_covariance);
+    return sampled;
+}
+
+double local::BinnedData::getScalarWeight() const {
+    return hasCovariance() ? std::exp(-_covariance->getLogDeterminant()/getNBinsWithData()) : _weight;
+}
+
+std::string local::BinnedData::getMemoryState() const {
+    std::string state = boost::str(boost::format("%6d %s%c ")
+        % getMemoryUsage(false) % (_weighted ? "CinvD" : "    D")
+        % (_dataCache.size() > 0 ? '+':'-')); // +/- indicates if complement to data is cached
+    if(hasCovariance()) {
+        state += boost::str(boost::format("refcount %2d ") % _covariance.use_count());
+        state += _covariance->getMemoryState();
+    }
+    else {
+        state += "no covariance";
+    }
+    return state;
 }

@@ -1,7 +1,14 @@
 // Created 16-Jun-2012 by David Kirkby (University of California, Irvine) <dkirkby@uci.edu>
 // A test program for studying resampling methods.
 
-#include "likely/likely.h"
+#include "likely/BinnedData.h"
+#include "likely/FitParameter.h"
+#include "likely/MarkovChainEngine.h"
+#include "likely/Random.h"
+#include "likely/UniformBinning.h"
+#include "likely/BinnedDataResampler.h"
+#include "likely/CovarianceMatrix.h"
+#include "likely/FunctionMinimum.h"
 
 #include "boost/program_options.hpp"
 #include "boost/foreach.hpp"
@@ -58,7 +65,7 @@ public:
         double sigma = params[0];
         std::vector<double> point, prediction;
         for(lk::BinnedData::IndexIterator iter = _data->begin(); iter != _data->end(); ++iter) {
-            _data->getBinCenters(*iter,point);
+            _data->getGrid().getBinCenters(*iter,point);
             prediction.push_back(model(point,sigma));
         }
         return 0.5*_data->chiSquare(prediction);
@@ -141,12 +148,13 @@ int main(int argc, char **argv) {
             lk::AbsBinningCPtr axis(new lk::UniformBinning(-range,+range,nbin));
             axes.push_back(axis);
         }
-        lk::BinnedDataPtr prototype(new lk::BinnedData(axes));
+        lk::BinnedGrid grid(axes);
+        lk::BinnedDataPtr prototype(new lk::BinnedData(grid));
         
         // Fill each bin of the prototype dataset with the model evaluated with sigma=sigma0
         std::vector<double> point(ndim);
-        for(int index = 0; index < prototype->getNBinsTotal(); ++index) {
-            prototype->getBinCenters(index,point);
+        for(int index = 0; index < grid.getNBinsTotal(); ++index) {
+            grid.getBinCenters(index,point);
             prototype->setData(index,model(point,sigma0));
         }
         int size(prototype->getNBinsWithData());

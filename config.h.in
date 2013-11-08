@@ -12,6 +12,12 @@
 /* Define to 1 if you have <boost/function.hpp> */
 #undef HAVE_BOOST_FUNCTION_HPP
 
+/* Define to 1 if you have <boost/program_options.hpp> */
+#undef HAVE_BOOST_PROGRAM_OPTIONS_HPP
+
+/* Define to 1 if you have <boost/regex.hpp> */
+#undef HAVE_BOOST_REGEX_HPP
+
 /* Define to 1 if you have <boost/scoped_ptr.hpp> */
 #undef HAVE_BOOST_SCOPED_PTR_HPP
 
@@ -30,8 +36,14 @@
 /* Define to 1 if you have the <inttypes.h> header file. */
 #undef HAVE_INTTYPES_H
 
+/* Define to 1 if you have the `blas' library (-lblas). */
+#undef HAVE_LIBBLAS
+
 /* Define to 1 if you have the `gsl' library (-lgsl). */
 #undef HAVE_LIBGSL
+
+/* Define to 1 if you have the `gslcblas' library (-lgslcblas). */
+#undef HAVE_LIBGSLCBLAS
 
 /* Define to 1 if you have the `lapack' library (-llapack). */
 #undef HAVE_LIBLAPACK

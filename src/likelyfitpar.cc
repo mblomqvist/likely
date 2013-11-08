@@ -1,7 +1,9 @@
 // Created 05-Jun-2012 by David Kirkby (University of California, Irvine) <dkirkby@uci.edu>
 // Demonstates the FitParameter class.
 
-#include "likely/likely.h"
+#include "likely/FitModel.h"
+#include "likely/FitParameter.h"
+#include "likely/RuntimeError.h"
 
 #include <iostream>
 #include <cassert>
@@ -34,7 +36,7 @@ int main(int argc, char *argv[]) {
     params.push_back(lk::FitParameter("param2",2,0.2));
     params.push_back(lk::FitParameter("param3",3,0.3));
     params.push_back(lk::FitParameter("(1-beta)*bias",1.23));
-    lk::printFitParametersToStream(params,std::cout);    
+    lk::printFitParametersToStream(params,std::cout);
 
     // This should be ok
     lk::modifyFitParameters(params,"");
@@ -59,6 +61,17 @@ int main(int argc, char *argv[]) {
     lk::printFitParametersToStream(params,std::cout);
     
     lk::modifyFitParameters(params,"boxprior[param2] @ (-1,2.3)");
+    lk::modifyFitParameters(params,"gaussprior[param1] @ (0.5,1.5;0.5)");
+    lk::printFitParametersToStream(params,std::cout);
+    
+    try {
+        lk::modifyFitParameters(params,"binning[param1] = [-1:+1]*4");
+        lk::modifyFitParameters(params,"binning[param3] = {-1,0,+1}");
+        lk::printFitParametersToStream(params,std::cout);
+    }
+    catch(lk::RuntimeError const &e) {
+        std::cout << e.what() << std::endl;
+    }
 
     try {
         lk::modifyFitParameters(params,"value [param3]=0;error [param3] = -123");
@@ -68,6 +81,10 @@ int main(int argc, char *argv[]) {
     }
     // Check that the parameters were not actually modified.
     lk::printFitParametersToStream(params,std::cout);
+    std::cout
+        << "-- script begin" << std::endl
+        << lk::fitParametersToScript(params)
+        << "-- script end" << std::endl;
     
     try {
         lk::FitParameter badName("a,b",123);
@@ -82,6 +99,13 @@ int main(int argc, char *argv[]) {
     catch(lk::RuntimeError const &e) {
         // We expect this since the pattern does not match any names.
         std::cout << "Got expected RuntimeError" << std::endl;
+    }
+    
+    // Test grid iteration
+    lk::BinnedGrid grid = getFitParametersGrid(params);
+    for(lk::BinnedGrid::Iterator iter = grid.begin(); iter != grid.end(); ++iter) {
+        std::string config = getFitParametersGridConfig(params,grid,iter);
+        std::cout << "config[" << (*iter) << "]: " << config << std::endl;
     }
     
     TestModel model;

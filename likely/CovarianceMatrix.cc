@@ -5,6 +5,8 @@
 #include "likely/Random.h"
 
 #include "boost/format.hpp"
+#include "boost/lexical_cast.hpp"
+#include "boost/smart_ptr.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -27,12 +29,16 @@ extern "C" {
     void dsyrk_(char const *uplo, char const *trans, int const *n, int const *k,
         double const *alpha, double const *a, int const *lda, double const *beta,
         double *c, int const *ldc);
+    // http://www.netlib.org/lapack/double/dspevd.f
+    void dspevd_(char const *jobz, char const *uplo, int const *n, double *ap, double *w,
+        double *z, int const *ldz, double *work, int const *lwork, int *iwork,
+        int const *liwork, int *info);
 }
 
 namespace local = likely;
 
 local::CovarianceMatrix::CovarianceMatrix(int size)
-: _size(size), _compressed(false)
+: _size(size), _compressed(false), _logDeterminant(0)
 {
     if(size <= 0) {
         throw RuntimeError("CovarianceMatrix: expected size > 0.");
@@ -43,7 +49,7 @@ local::CovarianceMatrix::CovarianceMatrix(int size)
 }
 
 local::CovarianceMatrix::CovarianceMatrix(std::vector<double> packed)
-: _ncov(packed.size()), _compressed(false)
+: _ncov(packed.size()), _compressed(false), _logDeterminant(0)
 {
     if(_ncov == 0) {
         throw RuntimeError("CovarianceMatrix: expected packed size > 0.");
@@ -71,6 +77,7 @@ void local::swap(CovarianceMatrix& a, CovarianceMatrix& b) {
     using std::swap;
     swap(a._size,b._size);
     swap(a._ncov,b._ncov);
+    swap(a._logDeterminant,b._logDeterminant);
     swap(a._compressed,b._compressed);
     swap(a._cov,b._cov);
     swap(a._icov,b._icov);
@@ -87,9 +94,9 @@ size_t local::CovarianceMatrix::getMemoryUsage() const {
 }
 
 std::string local::CovarianceMatrix::getMemoryState() const {
-    return boost::str(boost::format("[%c%c%c%c%c%c] %d") %
-        _tag('M',_cov) % _tag('I',_icov) % _tag('C',_cholesky) % _tag('D',_diag) %
-        _tag('Z',_offdiagIndex) % _tag('V',_offdiagValue) % getMemoryUsage());
+    return boost::str(boost::format("[%c%c%c%c%c%c%c] %d") %
+        _tag('M',_cov) % _tag('I',_icov) % _tag('C',_cholesky) % (_logDeterminant == 0 ? '-':'L') %
+        _tag('D',_diag) % _tag('Z',_offdiagIndex) % _tag('V',_offdiagValue) % getMemoryUsage());
 }
 
 char local::CovarianceMatrix::_tag(char symbol, std::vector<double> const &vector) const {
@@ -165,7 +172,7 @@ int local::symmetricMatrixSize(int nelem) {
     return size;
 }
 
-void local::choleskyDecompose(std::vector<double> &matrix, int size) {
+double local::choleskyDecompose(std::vector<double> &matrix, int size) {
     static char uplo('U');
     static int info(0);
     if(0 == size) size = symmetricMatrixSize(matrix.size());
@@ -174,6 +181,12 @@ void local::choleskyDecompose(std::vector<double> &matrix, int size) {
         info = 0;
         throw RuntimeError("choleskyDecomposition: matrix is not positive definite.");
     }
+    // Calculate and the product of diagonal Cholesky matrix elements squared.
+    double logdet(0);
+    for(int index = 0; index < size; ++index) {
+        logdet += 2*std::log(matrix[symmetricMatrixIndex(index,index,size)]);
+    }
+    return logdet;
 }
 
 void local::invertCholesky(std::vector<double> &matrix, int size) {
@@ -186,6 +199,28 @@ void local::invertCholesky(std::vector<double> &matrix, int size) {
         throw RuntimeError("invertCholesky: symmetric matrix inversion failed.");
     }
 } 
+
+void local::matrixSquare(std::vector<double> const &matrix, std::vector<double> &result,
+bool transposeLeft, int size) {
+    static char uplo('U');
+    static int info(0);
+    static double alpha(1),beta(0);
+    // Calculate the matrix size, if necessary.
+    if(0 == size) size = symmetricMatrixSize(matrix.size());
+    // Calculate Mt.M or M.Mt ?
+    char trans = transposeLeft ? 'T' : 'N';
+    boost::shared_array<double> unpackedResult(new double [size*size]);
+    dsyrk_(&uplo,&trans,&size,&size,&alpha,&matrix[0],&size,&beta,unpackedResult.get(),&size);
+    // Pack the result back into 'U' format.
+    result.resize(0);
+    result.reserve((size*(size+1))/2);
+    for(int col = 0; col < size; ++col) {
+        int base(col*size);
+        for(int row = 0; row <= col; ++row) {
+            result.push_back(unpackedResult[base++]);
+        }
+    }    
+}
 
 void local::symmetricMatrixMultiply(std::vector<double> const &matrix,
 std::vector<double> const &vector, std::vector<double> &result) {
@@ -200,6 +235,32 @@ std::vector<double> const &vector, std::vector<double> &result) {
     std::vector<double>(size).swap(result);
     // See http://netlib.org/blas/dspmv.f
     dspmv_(&uplo,&size,&alpha,&matrix[0],&vector[0],&incr,&beta,&result[0],&incr);
+}
+
+void local::symmetricMatrixEigenSolve(std::vector<double> const &matrix,
+std::vector<double> &eigenvalues, std::vector<double> &eigenvectors, int size) {
+    static char jobz('V'), uplo('U');
+    static int info(0);
+    // Calculate the matrix size if it was not provided.
+    if(0 == size) size = symmetricMatrixSize(matrix.size());
+    // Allocate space for the eigenvalues and vectors.
+    eigenvalues.resize(size), eigenvectors.resize(size*size);
+    {
+        // copy the input matrix since the algorithm overwrites it
+        std::vector<double> matrixCopy(matrix);
+        // allocate temporory workspaces
+        int workSize(1+6*size+size*size), iworkSize(3+5*size);
+        boost::scoped_array<double> work(new double[workSize]);
+        boost::scoped_array<int> iwork(new int[iworkSize]);
+        dspevd_(&jobz,&uplo,&size,&matrixCopy[0],&eigenvalues[0],&eigenvectors[0],&size,
+            &work[0],&workSize,&iwork[0],&iworkSize,&info);
+        if(0 != info) {
+            throw RuntimeError("symmetricMatrixEigenSolve: failed with info = " +
+                boost::lexical_cast<std::string>(info));
+            info = 0;
+        }
+        // cleanup temporary storage by closing this scope
+    }   
 }
 
 void local::CovarianceMatrix::prune(std::set<int> const &keep) {
@@ -240,6 +301,8 @@ void local::CovarianceMatrix::prune(std::set<int> const &keep) {
 
 void local::CovarianceMatrix::_changesCov() {
     _uncompress();
+    // Any cached determinant is now invalid.
+    _logDeterminant = 0;
     // Any cached compressed matrix data is now invalid so delete it.
     if(!_diag.empty()) {
         // TODO: use resize(0) instead?
@@ -257,7 +320,7 @@ void local::CovarianceMatrix::_changesCov() {
         else {
             // Try to invert the existing inverse covariance in place. This will throw a
             // RuntimeError in case the existing inverse covariance is only partially filled in.
-            choleskyDecompose(_icov,_size);
+            _logDeterminant = -choleskyDecompose(_icov,_size);
             invertCholesky(_icov,_size);
             // Remove the existing inverse covariance (by swapping with _cov), since it will
             // become invalid after we update the the covariance.
@@ -279,6 +342,8 @@ void local::CovarianceMatrix::_changesCov() {
 
 void local::CovarianceMatrix::_changesICov() {
     _uncompress();
+    // Any cached determinant is now invalid.
+    _logDeterminant = 0;
     // Any cached compressed matrix data is now invalid so delete it.
     if(!_diag.empty()) {
         // TODO: use resize(0) instead?
@@ -297,7 +362,8 @@ void local::CovarianceMatrix::_changesICov() {
             // Try to invert the existing covariance in place. This will throw a
             // RuntimeError in case the existing covariance is only partially filled in.
             if(_cholesky.empty()) {
-                choleskyDecompose(_cov,_size);
+                _logDeterminant = +choleskyDecompose(_cov,_size);
+                // No need to save this Cholesky decomposition since it will be invalid soon.
                 invertCholesky(_cov,_size);
                 // Remove the existing covariance (by swapping with _icov), since it will
                 // become invalid after we update the the covariance.
@@ -336,7 +402,7 @@ bool local::CovarianceMatrix::_readsCov() const {
             // Try to invert the existing inverse covariance into _cov. This will throw a
             // RuntimeError in case the existing inverse covariance is only partially filled in.
             _cov = _icov;
-            choleskyDecompose(_cov,_size);
+            _logDeterminant = -choleskyDecompose(_cov,_size);
             // (we don't bother keeping the Cholesky decomposition of the inverse covariance)
             invertCholesky(_cov,_size);
         }
@@ -358,7 +424,7 @@ bool local::CovarianceMatrix::_readsICov() const {
             if(_cholesky.empty()) {
                 // Calculate and save the covariance Cholesky decomposition.
                 _icov = _cov;
-                choleskyDecompose(_icov,_size);
+                _logDeterminant = +choleskyDecompose(_icov,_size);
                 _cholesky = _icov;
             }
             else {
@@ -379,7 +445,7 @@ void local::CovarianceMatrix::_readsCholesky() const {
                 "CovarianceMatrix: invalid Cholesky decomposition (no elements set yet).");
         }
         _cholesky = _cov;
-        choleskyDecompose(_cholesky,_size);
+        _logDeterminant = +choleskyDecompose(_cholesky,_size);
     }    
 }
 
@@ -403,7 +469,7 @@ double local::CovarianceMatrix::getInverseCovariance(int row, int col) const {
     return _icov[index];
 }
 
-void local::CovarianceMatrix::setCovariance(int row, int col, double value) {
+local::CovarianceMatrix &local::CovarianceMatrix::setCovariance(int row, int col, double value) {
     if(row == col && value <= 0) {
         throw RuntimeError("CovarianceMatrix: diagonal elements must be > 0.");
     }
@@ -415,9 +481,11 @@ void local::CovarianceMatrix::setCovariance(int row, int col, double value) {
     _changesCov();
     // Finally, set the new value here.
     _cov[index] = value;
+    // Return a self reference to allow chaining.
+    return *this;
 }
 
-void local::CovarianceMatrix::setInverseCovariance(int row, int col, double value) {
+local::CovarianceMatrix &local::CovarianceMatrix::setInverseCovariance(int row, int col, double value) {
     if(row == col && value <= 0) {
         throw RuntimeError("CovarianceMatrix: diagonal elements must be > 0.");
     }
@@ -429,6 +497,8 @@ void local::CovarianceMatrix::setInverseCovariance(int row, int col, double valu
     _changesICov();
     // Finally, set the new value here.
     _icov[index] = value;        
+    // Return a self reference to allow chaining.
+    return *this;
 }
 
 void local::CovarianceMatrix::multiplyByCovariance(std::vector<double> &vector) const {
@@ -453,6 +523,71 @@ double local::CovarianceMatrix::chiSquare(std::vector<double> const &delta) cons
         result += delta[k]*icovDelta[k];
     }
     return result;
+}
+
+void local::CovarianceMatrix::getEigenModes(
+std::vector<double> &eigenvalues, std::vector<double> &eigenvectors) const {
+    // Solve our eigensystem for Cinv
+    // TODO: if only C is available, solve its eigensystem instead, remembering to transform
+    // lambda -> 1/lambda and to reverse eigenvalues vector.
+    _readsICov();
+    symmetricMatrixEigenSolve(_icov,eigenvalues,eigenvectors,_size);    
+}
+
+double local::CovarianceMatrix::chiSquareModes(std::vector<double> const &delta,
+std::vector<double> &eigenvalues, std::vector<double> &eigenvectors,
+std::vector<double> &chi2modes) const {
+    getEigenModes(eigenvalues,eigenvectors);
+    // Loop over eigenmodes of Cinv
+    double chi2(0);
+    chi2modes.resize(0);
+    chi2modes.reserve(_size);
+    for(int i = 0; i < _size; ++i) {
+        // Calculate the dot product of eigenvector i with delta
+        double dotprod(0);
+        for(int j = 0; j < _size; ++j) {
+            dotprod += eigenvectors[i*_size + j]*delta[j];
+        }
+        // Calculate and save the contribution to chi2 due to this eigenmode.
+        double chi2i = dotprod*dotprod*eigenvalues[i];
+        // Replace lambda with 1/lambda so that we return decreasing eigenvalues of cov
+        // instead of increasing eigenvalues of icov.
+        eigenvalues[i] = 1/eigenvalues[i];
+        chi2modes.push_back(chi2i);
+        chi2 += chi2i;
+    }
+    return chi2;
+}
+
+void local::CovarianceMatrix::rescaleEigenvalues(std::vector<double> const &scales) {
+    if(scales.size() != _size) {
+        throw RuntimeError("CovarianceMatrix::rescaleEigenvalues: bad size for scales.");
+    }
+    // Solve our eigensystem for Cinv
+    _changesICov();
+    std::vector<double> eigenvalues,eigenvectors;
+    symmetricMatrixEigenSolve(_icov,eigenvalues,eigenvectors,_size);
+    // Rescale each eigenvalue.
+    std::vector<double> scaleFactors(eigenvalues);
+    for(int j = 0; j < _size; ++j) {
+        if(scales[j] <= 0) throw RuntimeError("CovarianceMatrix::rescaleEigenvalues: got scale <= 0.");
+        // The sqrt is because we will be use matrixSquare below.
+        scaleFactors[j] = std::sqrt(eigenvalues[j]/scales[j]);
+    }
+    // Next we replace X with S.X where S is a diagonal matrix of scaleFactors and X[j*size+i] is
+    // the i-th element of the j-th eigenvector.
+    int index(0);
+    // Loop over eigenvectors
+    for(int j = 0; j < _size; ++j) {
+        double scale = std::sqrt(eigenvalues[j]/scales[j]);
+        // Loop over components of this eigenvector
+        for(int i = 0; i < _size; ++i) {
+            //eigenvectors[index++] *= scaleFactors[i];
+            eigenvectors[index++] *= scale;
+        }
+    }
+    // Finally, fill _icov with X.Xt
+    matrixSquare(eigenvectors,_icov,false,_size);
 }
 
 double local::CovarianceMatrix::sample(std::vector<double> &delta, RandomPtr random) const {
@@ -654,7 +789,15 @@ std::vector<std::string> const &labels) const {
     if(labels.size() > 0 && labels.size() != _size) {
         throw RuntimeError("CovarianceMatrix::printToStream: unexpected number of labels.");
     }
-    boost::format indexFormat("%5d :"),labelFormat("%20s :"),valueFormat(format);
+    // Find longest label name to set the fixed width for output formatting
+    int width(0);
+    for(std::vector<std::string>::const_iterator iter = labels.begin();
+    iter != labels.end(); ++iter) {
+        int len = iter->size();
+        if(len > width) width = len;
+    }
+    std::string labelSpec = boost::str(boost::format("%%%ds :") % width);
+    boost::format indexFormat("%5d :"),labelFormat(labelSpec),valueFormat(format);
     for(int row = 0; row < _size; ++row) {
         os << ((labels.size() > 0) ? (labelFormat % labels[row]) : (indexFormat % row));
         for(int col = 0; col <= row; ++col) {
@@ -712,27 +855,68 @@ int local::CovarianceMatrix::getNElements() const {
     return nelem;
 }
 
-double local::CovarianceMatrix::getLogDeterminant() const {
-    // Calculate our Cholesky decomposition now, if necessary.
-    _readsCholesky();
-    // Our determinant is the product of diagonal Cholesky matrix elements squared.
-    double logdet(0);
-    for(int index = 0; index < _size; ++index) {
-        double diag(_cholesky[symmetricMatrixIndex(index,index,_size)]);
-        logdet += 2*std::log(diag);
+bool local::CovarianceMatrix::isPositiveDefinite() const {
+    // Positive definiteness is equivalent to having a valid Cholesky decomposition for
+    // either C or Cinv. Our implementation of getLogDeterminant() already keeps track
+    // of whether we have a valid decomposition and efficiently triggers a new decomposition
+    // when necessary, so use that.
+    try {
+        getLogDeterminant();
+        return true;
     }
-    return logdet;
+    catch(RuntimeError const &e) {
+        return false;
+    }
+}
+
+double local::CovarianceMatrix::getLogDeterminant() const {
+    // Only do the minimum work necessary...
+    if(0 == _logDeterminant) {
+        _uncompress();
+        // If we don't have a cached value then we have at most one of _icov or _cov,
+        // but not both. Do a Cholesky decomposition of whatever we have.
+        assert(_cholesky.empty());
+        assert(_cov.empty() || _icov.empty());
+        if(!_cov.empty()) {
+            // Calculate and save the covariance Cholesky decomposition now.
+            _cholesky = _cov;
+            _logDeterminant = +choleskyDecompose(_cholesky,_size);
+        }
+        else if(!_icov.empty()) {
+            // Calculate the inverse covariance Cholesky decomposition now.
+            _cholesky = _icov;
+            _logDeterminant = -choleskyDecompose(_cholesky,_size);
+            // Don't keep this decomposition, since this was the inverse.
+            std::vector<double>().swap(_cholesky);
+        }
+        else {
+            throw RuntimeError("CovarianceMatrix::getLogDeterminant: no elements have been set.");
+        }
+    }
+    assert(_logDeterminant != 0);
+    return _logDeterminant;
 }
 
 void local::CovarianceMatrix::applyScaleFactor(double scaleFactor) {
     if(scaleFactor <= 0) {
         throw RuntimeError("CovarianceMatrix::applyScaleFactor: expected scaleFactor > 0.");
     }
-    if(!_readsCov()) {
-        throw RuntimeError("CovarianceMatrix::applyScaleFactor: no elements have been set.");
+    // We could actually do this on a compressed object - maybe later...
+    _uncompress();
+    // Transform whatever vectors we have using the appropriate scale.
+    if(!_cov.empty()) {
+        double scale(scaleFactor);
+        for(int index = 0; index < _ncov; ++index) _cov[index] *= scale;
     }
-    _changesCov();
-    for(int index = 0; index < _ncov; ++index) _cov[index] *= scaleFactor;
+    if(!_icov.empty()) {
+        double scale(1/scaleFactor);
+        for(int index = 0; index < _ncov; ++index) _icov[index] *= scale;
+    }
+    if(!_cholesky.empty()) {
+        double scale(std::sqrt(scaleFactor));
+        for(int index = 0; index < _ncov; ++index) _cholesky[index] *= scale;
+    }
+    if(_logDeterminant != 0) _logDeterminant += _size*std::log(scaleFactor);
 }
 
 local::CovarianceMatrixPtr local::createDiagonalCovariance(int size, double diagonalValue) {

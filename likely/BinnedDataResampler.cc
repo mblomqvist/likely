@@ -5,6 +5,7 @@
 #include "likely/BinnedData.h"
 #include "likely/Random.h"
 #include "likely/CovarianceMatrix.h"
+#include "likely/CovarianceAccumulator.h"
 
 #include "boost/math/special_functions/binomial.hpp"
 
@@ -12,34 +13,84 @@
 
 namespace local = likely;
 
-local::BinnedDataResampler::BinnedDataResampler(RandomPtr random)
-: _random(random)
+local::BinnedDataResampler::BinnedDataResampler(bool useScalarWeights, RandomPtr random)
+: _useScalarWeights(useScalarWeights), _random(random), _combinedScalarWeight(0)
 {
     if(!_random) _random = Random::instance();
 }
 
 local::BinnedDataResampler::~BinnedDataResampler() { }
 
-void local::BinnedDataResampler::addObservation(BinnedDataCPtr observation) {
-    if(std::find(_observations.begin(), _observations.end(), observation) != _observations.end()) {
-        throw RuntimeError("BinnedDataResampler::addObservation: cannot add duplicate.");
+int local::BinnedDataResampler::addObservation(BinnedDataCPtr observation, int reuseCovIndex) {
+    //!!std::cout << "  add-in: " << observation->getMemoryState() << std::endl;
+    // Check that this new observation is congruent with what we have so far. Ignore covariance
+    // in the congruence test if we will be reusing a previous covariance matrix.
+    if(getNObservations() > 0) {
+        if(!_combined->isCongruent(*observation,false,reuseCovIndex >= 0)) {
+            throw RuntimeError("BinnedDataResampler::addObservation: new observation is incongruent.");
+        }
     }
-    if(getNObservations() > 0 && !_observations[0]->isCongruent(*observation)) {
-        throw RuntimeError("BinnedDataResampler::addObservation: new observation is incongruent.");
+    else {
+        bool binningOnly(true);
+        _combined.reset(observation->clone(binningOnly));
     }
-    _observations.push_back(observation);
+    int newIndex = _observations.size();
+    // Make a copy of this observation that we will keep.
+    BinnedDataPtr copy(observation->clone());
+    // Reuse the covariance of a previously added dataset?
+    if(reuseCovIndex >= 0) {
+        if(reuseCovIndex >= newIndex) {
+            throw RuntimeError("BinnedDataResampler::addObservation: invalid reuseCovIndex.");
+        }
+        BinnedDataCPtr reuseData = _observations[reuseCovIndex];
+        // This operation will need an input covariance if the dataset was previously weighted.
+        copy->unweightData();
+        if(_useScalarWeights) {
+            // We already dropped the previously added dataset's covariance, so we need to
+            // temporarily reconstruct something here that we can add to our combined dataset.
+            double weight = reuseData->getScalarWeight();
+            CovarianceMatrixPtr reconstructed(new CovarianceMatrix(*_combined->getCovarianceMatrix()));
+            reconstructed->applyScaleFactor(_combinedScalarWeight/weight);
+            copy->setCovarianceMatrix(reconstructed);
+        }
+        else {
+            if(!reuseData->hasCovariance()) {
+                throw RuntimeError("BinnedDataResampler::addObservation: no covariance to reuse.");
+            }
+            // Reuse the previously added dataset's covariance matrix.
+            copy->shareCovarianceMatrix(*reuseData);
+        }
+    }
+    else {
+        // Make a copy of the covariance matrix so changes to the input observation's
+        // covariance will not affect us (this is harmless if the copy doesn't actually
+        // have any covariance) and so that the operations below do not alter the input
+        // observation at all.
+        copy->cloneCovariance();
+    }
+    //!!std::cout << "add-tmp1: " << copy->getMemoryState() << std::endl;
+    // Add this copy to our combined dataset.
+    *_combined += *copy;
+    //!!std::cout << "add-tmp2: " << copy->getMemoryState() << std::endl;
+    //!!std::cout << "add-comb: " << _combined->getMemoryState() << std::endl;
+    if(_useScalarWeights) {
+        // Replace Cinv with the scalar weight |Cinv|^(1/n)
+        double weight = copy->getScalarWeight();
+        //!!std::cout << "add-tmp3: " << copy->getMemoryState() << std::endl;
+        copy->dropCovariance(weight);
+        _combinedScalarWeight += weight;
+    }
+    // Compress the copy before we save it (none of our resampling methods should uncompress it)
+    copy->compress();
+    // Remember this (copied) observation
+    //!!std::cout << " add-out: " << observation->getMemoryState() << std::endl;
+    //!!std::cout << "add-copy: " << copy->getMemoryState() << std::endl;
+    _observations.push_back(copy);
+    return newIndex;
 }
 
 local::BinnedDataPtr local::BinnedDataResampler::combined() const {
-    BinnedDataPtr all;
-    int size(_observations.size());
-    // Return an unassigned shared pointer if we don't have any observations yet.
-    if(0 == size) return all;
-    // Create an empty dataset with the right axis binning.
-    all.reset(_observations[0]->clone(true));
-    for(int obsIndex = 0; obsIndex < size; ++obsIndex) {
-        *all += *_observations[obsIndex];
-    }
+    BinnedDataPtr all(_combined->clone());
     return all;
 }
 
@@ -69,6 +120,15 @@ bool local::getSubset(int n, unsigned long seqno, std::vector<int> &subset) {
     return true;
 }
 
+void local::BinnedDataResampler::_addCovariance(BinnedDataPtr sample) const {
+    if(!_useScalarWeights) return;
+    sample->unweightData();
+    double weight = sample->getScalarWeight();
+    CovarianceMatrixPtr cov(new CovarianceMatrix(*_combined->getCovarianceMatrix()));
+    cov->applyScaleFactor(_combinedScalarWeight/weight);
+    sample->setCovarianceMatrix(cov);
+}
+
 local::BinnedDataCPtr local::BinnedDataResampler::getObservation(int index) const {
     if(index < 0 || index >= getNObservations()) {
         throw RuntimeError("BinnedDataResampler::getObservation: index of our range.");
@@ -76,15 +136,17 @@ local::BinnedDataCPtr local::BinnedDataResampler::getObservation(int index) cons
     return _observations[index];
 }
 
-local::BinnedDataPtr local::BinnedDataResampler::getObservationCopy(int index) const {
+local::BinnedDataPtr local::BinnedDataResampler::getObservationCopy(int index, bool addCovariance) const {
     if(index < 0 || index >= getNObservations()) {
         throw RuntimeError("BinnedDataResampler::getObservation: index of our range.");
     }
     BinnedDataPtr copy(_observations[index]->clone());
+    if(addCovariance) _addCovariance(copy);
     return copy;
 }
 
-local::BinnedDataPtr local::BinnedDataResampler::jackknife(int ndrop, unsigned long seqno) const {
+local::BinnedDataPtr local::BinnedDataResampler::jackknife(int ndrop, unsigned long seqno,
+bool addCovariance) const {
     int nobs(_observations.size());
     if(ndrop < 0 || ndrop >= nobs) {
         throw RuntimeError("BinnedDataResampler::jackknife: invalid ndrop.");
@@ -99,13 +161,16 @@ local::BinnedDataPtr local::BinnedDataResampler::jackknife(int ndrop, unsigned l
     for(int obsIndex = 0; obsIndex < nkeep; ++obsIndex) {
         *resample += *_observations[_subset[obsIndex]];
     }
+    if(addCovariance) _addCovariance(resample);
     return resample;
 }
 
-local::BinnedDataPtr local::BinnedDataResampler::bootstrap(int size, bool fixCovariance) const {
-    if(size <= 0) {
+local::BinnedDataPtr local::BinnedDataResampler::bootstrap(int size, bool fixCovariance,
+bool addCovariance) const {
+    if(size < 0) {
         throw RuntimeError("BinnedDataResampler::bootstrap: invalid size.");
     }
+    if(0 == size) size = getNObservations();
     if(0 == getNObservations()) return BinnedDataPtr();
     // Do we need to (re)initialize our counts vector?
     if(_counts.size() != _observations.size()) {
@@ -116,7 +181,7 @@ local::BinnedDataPtr local::BinnedDataResampler::bootstrap(int size, bool fixCov
     // Create an empty dataset with the right axis binning.
     BinnedDataPtr resample(_observations[0]->clone(true));
     // We cannot fix a non-existent covariance.
-    if(!_observations[0]->hasCovariance()) fixCovariance = false;
+    if(!_observations[0]->hasCovariance() || _useScalarWeights) fixCovariance = false;
     // Initialize matrix needed to fix final covariance.
     likely::CovarianceMatrixPtr D;
     int nbins = _observations[0]->getNBinsWithData();
@@ -133,5 +198,25 @@ local::BinnedDataPtr local::BinnedDataResampler::bootstrap(int size, bool fixCov
     }
     // We can skip this relatively expensive operation if all counts are 0,1.
     if(duplicatesFound && fixCovariance) resample->transformCovariance(D);
+    if(addCovariance) _addCovariance(resample);
     return resample;
+}
+
+local::CovarianceAccumulatorPtr
+local::BinnedDataResampler::estimateCombinedCovariance(int nSamples,
+AccumulationCallback callback, int interval) const {
+    if(nSamples <= 0) {
+        throw RuntimeError("BinnedDataResampler::estimateCombinedCovariance: expected nSamples > 0.");
+    }
+    if(0 == getNObservations()) return CovarianceAccumulatorPtr();
+    CovarianceAccumulatorPtr accumulator(new CovarianceAccumulator(_observations[0]->getNBinsWithData()));
+    bool fixCovariance(false),addCovariance(false);
+    for(int sample = 0; sample < nSamples; ++sample) {
+        BinnedDataPtr data = bootstrap(0,fixCovariance,addCovariance);
+        accumulator->accumulate(data);
+        if(interval > 0 && (sample+1) % interval == 0) {
+            if(!callback(accumulator)) break;
+        }
+    }
+    return accumulator;
 }

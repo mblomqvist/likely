@@ -42,8 +42,15 @@ namespace likely {
         int getSize() const;
         // Returns the number of non-zero covariance matrix elements stored in this object.
         int getNElements() const;
-        // Returns the (natural) log of the determinant of this covariance matrix.
+        // Returns the (natural) log of the determinant of this covariance matrix. The value is
+        // cached so repeated calls to this method are inexpensive. A cached value is available
+        // after compression, so call this method before compress() if you will need it. Otherwise,
+        // this method will trigger a decompression in order to calculate its result.
         double getLogDeterminant() const;
+        // Returns true if we are positive definite, which is not automatically true while a
+        // matrix is being built or modified element by element. This test is relatively expensive
+        // but its result is cached.
+        bool isPositiveDefinite() const;
         
         // Returns the specified (inverse) covariance matrix element or throws a RuntimeError.
         // (row,col) and (col,row) give the same result by construction. Be aware that
@@ -56,8 +63,19 @@ namespace likely {
         // row != col will also set the symmetric element in the matrix. Diagonal elements
         // (row == col) must be positive. Be aware that going back and forth between Covariance
         // and InverseCovariance operations requires potentially expensive matrix operations.
-        void setCovariance(int row, int col, double value);
-        void setInverseCovariance(int row, int col, double value);
+        // Methods return a self reference and so can be chained, e.g.
+        //
+        //   cov.setCovariance(0,0,0.5).setCovariance(0,1,-0.5).setCovariance(0,2,0.3);
+        //
+        // Use (*cov).set... to chain calls on a (smart) pointer. You can safely ignore the
+        // return value if you are not using this functionality.
+        CovarianceMatrix &setCovariance(int row, int col, double value);
+        CovarianceMatrix &setInverseCovariance(int row, int col, double value);
+        
+        // Fills the vectors provided with the eigenvectors and eigenmodes of our inverse covariance.
+        // Vectors are ordered by increasing inverse covariance eigenvalue, i.e., from large to small
+        // variance. See symmetricMatrixEigenSolve for details.
+        void getEigenModes(std::vector<double> &eigenvalues, std::vector<double> &eigenvectors) const;
 
         // Multiplies the specified vector by the (inverse) covariance or throws a RuntimeError.
         // The result is stored in the input vector, overwriting its original contents.
@@ -66,9 +84,21 @@ namespace likely {
         // Calculates the chi-square = delta.Cinv.delta for the specified residuals vector delta
         // or throws a RuntimeError.
         double chiSquare(std::vector<double> const &delta) const;
+        // Calculates the contributions to the chi-square for delta associated with each of
+        // our eigenmodes, or throws a RuntimeError. Returns the chi-square value and fills the
+        // vectors provided with the eigenvalues (in decreasing order), corresponding orthonormal
+        // eigenvectors (j-th element of i-th vector is at i*size+j), and chi-square mode
+        // contributions calculated as (eigenvec[i].delta)^2/lambda[i]. The returned chi-square
+        // is the sum of these contributions.
+        double chiSquareModes(std::vector<double> const &delta,
+            std::vector<double> &eigenvalues, std::vector<double> &eigenvectors,
+            std::vector<double> &chi2modes) const;
 
         // Multiplies all elements of the covariance matrix by the specified positive scale factor.
         void applyScaleFactor(double scaleFactor);
+        // Rescales the covariance eigenvalues, listed in decreasing order, with the specified
+        // vector of scale factors.
+        void rescaleEigenvalues(std::vector<double> const &scales);
         // Replaces the original covariance matrix contents C with the triple matrix
         // product A.Cinv.A for the specified other covariance matrix A. For A,C both positive
         // definite, the result is a new (positive definite) covariance matrix.
@@ -114,8 +144,12 @@ namespace likely {
         // if possible. Returns immediately if we are already compressed. Any compression
         // is lossless. The next call to any method except getSize(), compress(), or isCompressed().
         // will automatically trigger a decompression. However, a compressed matrix can be
-        // added to another matrix (via addInverse) without being uncompressed. Return value
-        // indicates if any compression was actually performed.
+        // added to another matrix (via addInverse) without being uncompressed. Also, we may
+        // already have a cached log(determinant) value as a side effect of previous operations,
+        // which can be retrieved by getLogDeterminant() without uncompression. If determinant
+        // caching is an important optimization for your application, be sure to call
+        // getLogDeterminant() before calling compress(). Return value indicates if any
+        // compression was actually performed.
         bool compress() const;
         // Returns true if this covariance matrix is currently compressed.
         bool isCompressed() const;
@@ -128,19 +162,21 @@ namespace likely {
         // where each letter indicates the memory allocation state of an internal
         // vector and nnnnnn is the total number of bytes used by this object, as reported
         // by getMemoryUsage(). The letter codes are: M = _cov, I = _icov, C = _cholesky,
-        // D = _diag, Z = _offdiagIndex, V = _offdiagValue. A "-" indidcates that the vector
-        // is not allocated. A "." below is a wildcard.
+        // L = log(det), D = _diag, Z = _offdiagIndex, V = _offdiagValue. A "-" indidcates
+        // that the vector is not allocated. A "." below is a wildcard. Lower case indicates
+        // that the vector has spaced reserved but is empty.
         //
-        // [---...] : newly created object with no elements set
-        // [M--...] : most recent change was to covariance matrix
-        // [-I-...] : most recent change was to inverse covariance matrix
-        // [MI-...] : synchronized covariance and inverse covariance both in memory
-        // [--C...] : ** this should never happen **
-        // [M-C...] : Cholesky decomposition and covariance in memory
-        // [-IC...] : Cholesky decomposition and inverse covariance in memory
-        // [MIC...] : Cholesky decomposition, covariance and inverse covariance in memory
-        // [...D--] : Matrix is diagonal and compressed
-        // [...DZV] : Matrix is non-diagonal and compressed
+        // [----...] : newly created object with no elements set
+        // [M---...] : most recent change was to covariance matrix
+        // [-I--...] : most recent change was to inverse covariance matrix
+        // [MI-L...] : synchronized covariance and inverse covariance both in memory
+        // [--C....] : ** this should never happen **
+        // [M-CL...] : Cholesky decomposition and covariance in memory
+        // [-ICL...] : Cholesky decomposition and inverse covariance in memory
+        // [MICL...] : Cholesky decomposition, covariance and inverse covariance in memory
+        // [....D--] : Matrix is diagonal and compressed
+        // [...-DZV] : Matrix is non-diagonal and compressed without cached log(det)
+        // [...LDZV] : Matrix is non-diagonal and compressed with cached log(det)
         std::string getMemoryState() const;
         
     private:
@@ -162,6 +198,10 @@ namespace likely {
 
         // TODO: is a cached value of _ncov = (_size*(_size+1))/2 really necessary?
         int _size, _ncov;
+        // Remembers the value of our log(determinant), or is zero if no valid cached value
+        // is available. Value is calculated, if necessary, when getLogDeterminant() is called
+        // and is reset when _changesCov or _changesICov are called.
+        mutable double _logDeterminant;
         // Track our compression state. This is not the same as !_diag.empty() since we
         // cache previous compression data until a change to _cov or _icov invalidates it.
         mutable bool _compressed;
@@ -178,9 +218,16 @@ namespace likely {
     
     inline bool CovarianceMatrix::isCompressed() const { return _compressed; }
 
-    // Returns the array offset index for the BLAS packed symmetric matrix format
+    // Returns the array offset index for the BLAS packed 'U' symmetric matrix format
     // described at http://www.netlib.org/lapack/lug/node123.html or throws a
-    // RuntimeError for invalid row or col inputs.
+    // RuntimeError for invalid row or col inputs. The corresponding iterator sequence is:
+    //
+    //   int index(0);
+    //   for(int col = 0; col < size; ++col) {
+    //     for(int row = 0; row <= col; ++row) {
+    //       index++;
+    //     }
+    //   }
     int symmetricMatrixIndex(int row, int col, int size);
     // Returns the size of a symmetric matrix in the BLAS packed format implied by
     // symmetricMatrixIndex, or throws a RuntimeError. The size is related to the
@@ -189,17 +236,32 @@ namespace likely {
     // Performs a Cholesky decomposition in place of a symmetric positive definite matrix
     // or throws a RuntimeError if the matrix is not positive definite. The input matrix
     // is assumed to be in the BLAS packed format implied by packedMatrixIndex(row,col).
-    // The matrix size will be calculated unless a positive value is provided.
-    static void choleskyDecompose(std::vector<double> &matrix, int size = 0);
+    // The matrix size will be calculated unless a positive value is provided. Returns
+    // the log(determinant) of the input matrix, calculated as the product of the diagonal
+    // elements of the Cholesky decomposition.
+    double choleskyDecompose(std::vector<double> &matrix, int size = 0);
     // Inverts a symmetric positive definite matrix in place, or throws a RuntimeError.
-    // The input matrix should already be Cholesky decomposed and in the BLAS packed format
+    // The input matrix should already be Cholesky decomposed and in the BLAS packed 'U' format
     // implied by packedMatrixIndex(row,col), e.g. by first calling _choleskyDecompose(matrix).
     // The matrix size will be calculated unless a positive value is provided.
-    static void invertCholesky(std::vector<double> &matrix, int size = 0);
+    void invertCholesky(std::vector<double> &matrix, int size = 0);
     // Multiplies a symmetric matrix by a vector, or throws a RuntimeError. The input matrix
-    // is assumed to be in the BLAS packed format implied by packedMatrixIndex(row,col).
-    static void symmetricMatrixMultiply(std::vector<double> const &matrix,
+    // is assumed to be in the BLAS packed 'U' format implied by packedMatrixIndex(row,col).
+    void symmetricMatrixMultiply(std::vector<double> const &matrix,
         std::vector<double> const &vector, std::vector<double> &result);
+    // Fills the result vector with Mt.M (transposeLeft = true) or M.Mt (transposeLeft = false)
+    // where M is the input (unpacked) matrix, and result is in the BLAS packed 'U' format
+    // implied by packedMatrixIndex(row,col). The matrix size will be calculated unless a
+    // positive value is provided. 
+    void matrixSquare(std::vector<double> const &matrix, std::vector<double> &result,
+        bool transposeLeft, int size = 0);
+    // Solves the eigensystem for a symmetric matrix, or throws a RuntimeError. The input matrix
+    // is assumed to be in the BLAS packed 'U' format implied by packedMatrixIndex(row,col).
+    // The matrix size will be calculated unless a positive value is provided. Fills eigenvalues
+    // and eigenvectors so that eigenvalues are in increasing order and the corresponding
+    // eigenvectors are orthonormal.
+    void symmetricMatrixEigenSolve(std::vector<double> const &matrix,
+        std::vector<double> &eigenvalues, std::vector<double> &eigenvectors, int size = 0);
         
     // Creates a diagonal covariance matrix with constant elements (first form) or specified
     // positive elements (second form).

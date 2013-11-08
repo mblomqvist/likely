@@ -1,7 +1,11 @@
 // Created 18-Apr-2012 by David Kirkby (University of California, Irvine) <dkirkby@uci.edu>
-// Demonstates the CovarianceMatrix class.
+// Demonstrates and tests the CovarianceMatrix class.
 
-#include "likely/likely.h"
+#include "likely/Random.h"
+#include "likely/CovarianceMatrix.h"
+#include "likely/CovarianceAccumulator.h"
+
+#include "boost/lexical_cast.hpp"
 
 #include <iostream>
 #include <sys/resource.h>
@@ -20,6 +24,61 @@ int main(int argc, char **argv) {
 
     lk::Random::instance()->setSeed(123);
     
+    {
+        // Generate a random covariance matrix.
+        int size(4);
+        lk::CovarianceMatrixCPtr cov = lk::generateRandomCovariance(size);
+        std::vector<double> matrix;
+        for(int col = 0; col < size; ++col) {
+            for(int row = 0; row <= col; ++row) {
+                double value = cov->getCovariance(row,col);
+                matrix.push_back(value);
+                // print matrix elements with full precision for offline checks
+                std::cout << row << ' ' << col << ' '
+                    << boost::lexical_cast<std::string>(value) << std::endl;
+            }
+        }
+        // Solve the eigensystem and find chi2 modes assuming some delta.
+        std::vector<double> eigenvalues, eigenvectors, chi2modes,delta(size,1);
+        double chi2 = cov->chiSquareModes(delta,eigenvalues,eigenvectors,chi2modes);
+        std::cout << "chi2 = " << chi2 << " =?= " << cov->chiSquare(delta) << std::endl;
+        // Print results
+        for(int i = 0; i < size; ++i) {
+            std::cout << "[" << i << "] mode = " << chi2modes[i] << ", lambda = "
+                << eigenvalues[i] << ", vector: ";
+            for(int j = 0; j < size; ++j) {
+                std::cout << ' ' << eigenvectors[i*size+j];
+            }
+            std::cout << std::endl;
+        }
+        std::vector<double> lsquare,rsquare;
+        lk::matrixSquare(eigenvectors,lsquare,true,size);
+        lk::matrixSquare(eigenvectors,rsquare,true,size);
+        for(int col = 0; col < size; ++col) {
+            for(int row = 0; row <= col; ++row) {
+                int index = lk::symmetricMatrixIndex(row,col,size);
+                std::cout << index << ' ' << row << ' ' << col << ' '
+                    << cov->getCovariance(row,col) << ' '
+                    << lsquare[index] << ' ' << rsquare[index] << std::endl;
+            }
+        }
+        std::vector<double> scales;
+        for(int i = 0; i < size; ++i) scales.push_back(i+1);
+        lk::CovarianceMatrixPtr cov2(new lk::CovarianceMatrix(*cov));
+        cov2->rescaleEigenvalues(scales);
+        cov2->printToStream(std::cout);
+        chi2 = cov2->chiSquareModes(delta,eigenvalues,eigenvectors,chi2modes);
+        std::cout << "rescaled chi2 = " << chi2 << std::endl;
+        for(int i = 0; i < size; ++i) {
+            std::cout << "[" << i << "] mode = " << chi2modes[i] << ", lambda = "
+                << eigenvalues[i] << ", vector: ";
+            for(int j = 0; j < size; ++j) {
+                std::cout << ' ' << eigenvectors[i*size+j];
+            }
+            std::cout << std::endl;
+        }
+    }
+    
     int size(3);
     lk::CovarianceMatrix cov(size);
     std::cout << cov.getMemoryState() << std::endl;
@@ -29,11 +88,17 @@ int main(int argc, char **argv) {
     cov.setCovariance(0,1,0.1);
     cov.setCovariance(1,2,-0.2);
     std::cout << cov.getMemoryState() << std::endl;
+    std::cout << "log(det) = " << cov.getLogDeterminant() << std::endl;
+    std::cout << cov.getMemoryState() << std::endl;
     cov.sample(1);
+    std::cout << cov.getMemoryState() << std::endl;
+    std::cout << "log(det) = " << cov.getLogDeterminant() << std::endl;
     std::cout << cov.getMemoryState() << std::endl;
     
     lk::CovarianceMatrix empty(size);
     cov.addInverse(empty,2);
+    std::cout << cov.getMemoryState() << std::endl;
+    std::cout << "log(det) = " << cov.getLogDeterminant() << std::endl;
     std::cout << cov.getMemoryState() << std::endl;
     
     cov.setInverseCovariance(2,2,0.3);
